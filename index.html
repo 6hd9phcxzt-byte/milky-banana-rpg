@@ -1,0 +1,631 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Milky & Banana RPG</title>
+<style>
+  body { margin:0; background:#111; color:#fff; font-family:monospace; text-align:center; }
+  canvas { image-rendering:pixelated; background:black; display:block; margin:10px auto 0; border:1px solid #333; }
+  #ui { margin:10px auto; max-width:320px; }
+  button { width:140px; height:44px; margin:6px; font-size:14px; }
+  .small { width:140px; height:36px; font-size:12px; opacity:0.95; }
+  .row { display:flex; justify-content:center; flex-wrap:wrap; gap:6px; }
+</style>
+</head>
+<body>
+
+<canvas id="game" width="256" height="256"></canvas>
+<div id="ui"></div>
+
+<script>
+/* ===================== CANVAS ===================== */
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+ctx.font = "10px monospace";
+const tile = 16;
+
+/* ===================== GAME STATE ===================== */
+let mode = "title"; // title | world | battle | win
+let steps = 0;
+let battleText = "";
+let enemy = null;
+
+let player = { x: 7, y: 7 };
+
+let flags = {
+  bossUnlocked: true,     // left on for demo
+  bossDefeated: false
+};
+
+/* ===================== PARTY ===================== */
+let party = {
+  milky:  { name:"Milky",  lvl:1, xp:0, next:20, hp:30, maxHp:30, mp:10, maxMp:10, atk:5, acted:false },
+  banana: { name:"Banana", lvl:1, xp:0, next:20, hp:25, maxHp:25, mp: 8, maxMp: 8, atk:6, acted:false }
+};
+
+/* ===================== AUDIO (SFX + MUSIC) ===================== */
+const AC = window.AudioContext || window.webkitAudioContext;
+let audio = null;
+let musicTimer = null;
+let musicOn = true;
+
+function ensureAudio(){
+  if (!audio) audio = new AC();
+  // iOS sometimes starts suspended until a gesture:
+  if (audio.state === "suspended") audio.resume().catch(()=>{});
+}
+
+function beep(freq=440, dur=0.08, vol=0.05){
+  if (!audio) return;
+  const o = audio.createOscillator();
+  const g = audio.createGain();
+  o.type = "square";
+  o.frequency.value = freq;
+  g.gain.value = vol;
+  o.connect(g);
+  g.connect(audio.destination);
+  o.start();
+  o.stop(audio.currentTime + dur);
+}
+
+const sfx = {
+  attack: ()=> beep(440, 0.07, 0.05),
+  special:()=> beep(220, 0.12, 0.06),
+  enemy:  ()=> beep(110, 0.10, 0.06),
+  win:    ()=> { beep(660,0.10,0.05); setTimeout(()=>beep(880,0.10,0.05),120); },
+  level:  ()=> { beep(880,0.08,0.05); setTimeout(()=>beep(1320,0.12,0.05),100); },
+  menu:   ()=> beep(520,0.05,0.04)
+};
+
+// Simple 8-bit looping melody (works well on phones)
+// Notes are frequencies; 0 = rest
+const melody = [
+  392, 0, 392, 0, 440, 0, 392, 0,
+  330, 0, 330, 0, 349, 0, 330, 0,
+  392, 0, 523, 0, 494, 0, 440, 0,
+  392, 0, 349, 0, 330, 0, 294, 0
+];
+let melodyIndex = 0;
+
+function startMusic(){
+  if (!musicOn) return;
+  ensureAudio();
+  stopMusic();
+  melodyIndex = 0;
+  musicTimer = setInterval(()=>{
+    if (!audio || audio.state !== "running") return;
+    const f = melody[melodyIndex % melody.length];
+    melodyIndex++;
+    if (f !== 0) beep(f, 0.09, 0.025);
+  }, 140);
+}
+
+function stopMusic(){
+  if (musicTimer) { clearInterval(musicTimer); musicTimer = null; }
+}
+
+/* ===================== SAVE / LOAD ===================== */
+const SAVE_KEY = "MB_SAVE_V2";
+
+function hasSave(){
+  return !!localStorage.getItem(SAVE_KEY);
+}
+
+function saveGame(){
+  localStorage.setItem(SAVE_KEY, JSON.stringify({ party, player, flags }));
+}
+
+function loadGame(){
+  const raw = localStorage.getItem(SAVE_KEY);
+  if (!raw) return false;
+  try{
+    const d = JSON.parse(raw);
+    if (d.party) party = d.party;
+    if (d.player) player = d.player;
+    if (d.flags) flags = d.flags;
+    return true;
+  }catch(e){
+    return false;
+  }
+}
+
+function resetSave(){
+  localStorage.removeItem(SAVE_KEY);
+}
+
+/* ===================== SPRITES ===================== */
+function drawMilky(x,y){
+  ctx.fillStyle="#fff"; ctx.fillRect(x,y,12,12);
+  ctx.fillStyle="#ccc"; ctx.fillRect(x+3,y-3,6,3);
+  ctx.fillStyle="#9fd3ff"; ctx.fillRect(x+2,y+3,8,2);
+}
+function drawBanana(x,y){
+  ctx.strokeStyle="#ffe135"; ctx.lineWidth=3;
+  ctx.beginPath(); ctx.arc(x+6,y+6,6,Math.PI*0.2,Math.PI*1.2); ctx.stroke();
+  ctx.fillStyle="#000"; ctx.fillRect(x+8,y+7,1,1);
+}
+function drawEnemySprite(x,y,kind="blob"){
+  if(kind==="boss"){
+    ctx.fillStyle="#ff66cc";
+    ctx.fillRect(x,y,18,18);
+    ctx.fillStyle="#000";
+    ctx.fillRect(x+5,y+6,2,2);
+    ctx.fillRect(x+11,y+6,2,2);
+    ctx.fillRect(x+8,y+11,2,1);
+    ctx.fillStyle="#fff";
+    ctx.fillRect(x+3,y-2,12,3); // little "crown"
+  } else {
+    ctx.fillStyle="#ff4d4d";
+    ctx.beginPath(); ctx.arc(x+8,y+8,8,0,Math.PI*2); ctx.fill();
+  }
+}
+
+/* ===================== UI ===================== */
+const ui = document.getElementById("ui");
+
+function setUI(html){
+  ui.innerHTML = html;
+}
+
+function setTitleUI(){
+  const cont = hasSave() ? `<button onclick="continueGame()">Continue</button>` : `<button disabled>Continue</button>`;
+  setUI(`
+    <div style="margin-top:6px;">
+      <div style="font-size:18px; margin-bottom:6px;">Milky & Banana RPG</div>
+      <div style="opacity:0.85; font-size:12px; margin-bottom:10px;">
+        Tap Start to enable sound • Walk to the fridge door for the Boss
+      </div>
+      <div class="row">
+        <button onclick="startNew()">Start</button>
+        ${cont}
+      </div>
+      <div class="row">
+        <button class="small" onclick="toggleMusic()">${musicOn ? "Music: ON" : "Music: OFF"}</button>
+        <button class="small" onclick="hardReset()">Reset Save</button>
+      </div>
+      <div style="opacity:0.75; font-size:12px; margin-top:8px;">
+        Controls appear under the game.
+      </div>
+    </div>
+  `);
+}
+
+function setWorldUI(){
+  setUI(`
+    <div class="row">
+      <button onclick="move(0,-1)">⬆️</button>
+    </div>
+    <div class="row">
+      <button onclick="move(-1,0)">⬅️</button>
+      <button onclick="move(1,0)">➡️</button>
+    </div>
+    <div class="row">
+      <button onclick="move(0,1)">⬇️</button>
+    </div>
+    <div class="row">
+      <button class="small" onclick="openMenu()">Menu</button>
+      <button class="small" onclick="toggleMusic()">${musicOn ? "Music: ON" : "Music: OFF"}</button>
+    </div>
+  `);
+}
+
+function setBattleUI(){
+  setUI(`
+    <div class="row">
+      <button onclick="attack('milky')">Milky Attack</button>
+      <button onclick="milkSplash()">Milk Splash</button>
+    </div>
+    <div class="row">
+      <button onclick="attack('banana')">Banana Attack</button>
+      <button onclick="bananaSlam()">Banana Slam</button>
+    </div>
+  `);
+}
+
+function setWinUI(){
+  setUI(`
+    <div style="margin-top:6px;">
+      <div style="font-size:18px; margin-bottom:8px;">You Beat The Demo!</div>
+      <div style="opacity:0.85; font-size:12px; margin-bottom:12px;">
+        Milky & Banana saved the fridge snacks. More quests next.
+      </div>
+      <div class="row">
+        <button onclick="goTitle()">Title</button>
+        <button onclick="startNew()">New Run</button>
+      </div>
+    </div>
+  `);
+}
+
+/* ===================== TITLE ACTIONS ===================== */
+function goTitle(){
+  mode = "title";
+  stopMusic();
+  draw();
+  setTitleUI();
+}
+
+function startNew(){
+  ensureAudio();
+  sfx.menu();
+  // reset run
+  player = {x:7,y:7};
+  flags = { bossUnlocked:true, bossDefeated:false };
+  party = {
+    milky:  { name:"Milky",  lvl:1, xp:0, next:20, hp:30, maxHp:30, mp:10, maxMp:10, atk:5, acted:false },
+    banana: { name:"Banana", lvl:1, xp:0, next:20, hp:25, maxHp:25, mp: 8, maxMp: 8, atk:6, acted:false }
+  };
+  saveGame();
+  mode = "world";
+  setWorldUI();
+  startMusic();
+  draw();
+}
+
+function continueGame(){
+  ensureAudio();
+  sfx.menu();
+  loadGame();
+  mode = flags.bossDefeated ? "win" : "world";
+  if (mode === "win"){
+    setWinUI();
+  } else {
+    setWorldUI();
+  }
+  startMusic();
+  draw();
+}
+
+function hardReset(){
+  ensureAudio();
+  sfx.menu();
+  resetSave();
+  goTitle();
+}
+
+function toggleMusic(){
+  ensureAudio();
+  musicOn = !musicOn;
+  sfx.menu();
+  if (!musicOn) stopMusic();
+  else if (mode === "world" || mode === "title") startMusic();
+  // refresh UI label
+  if (mode === "title") setTitleUI();
+  if (mode === "world") setWorldUI();
+}
+
+/* ===================== WORLD ===================== */
+const fridgeDoor = { x: 15, y: 7 }; // walk here to trigger boss
+
+function move(dx,dy){
+  if (mode !== "world") return;
+
+  player.x = Math.max(0, Math.min(15, player.x + dx));
+  player.y = Math.max(0, Math.min(15, player.y + dy));
+  steps++;
+
+  // Boss trigger
+  if (!flags.bossDefeated && flags.bossUnlocked && player.x === fridgeDoor.x && player.y === fridgeDoor.y){
+    startBossBattle();
+    return;
+  }
+
+  // Random encounter
+  if (Math.random() < 0.25 && steps > 3){
+    startBattle(false);
+    steps = 0;
+    return;
+  }
+
+  saveGame();
+  draw();
+}
+
+function openMenu(){
+  ensureAudio();
+  sfx.menu();
+  // simple quick menu: just go to title (doesn't reset)
+  stopMusic();
+  mode = "title";
+  draw();
+  setTitleUI();
+}
+
+/* ===================== BATTLE ===================== */
+function resetTurn(){
+  party.milky.acted = false;
+  party.banana.acted = false;
+}
+
+function startBattle(isBoss){
+  stopMusic();
+  mode = "battle";
+
+  if (isBoss){
+    enemy = {
+      kind:"boss",
+      name:"Fridge Guardian",
+      hp:120, maxHp:120,
+      atk:8,
+      phase:1
+    };
+    battleText = "The Fridge Guardian blocks the snacks!";
+  } else {
+    enemy = {
+      kind:"mob",
+      name:"Evil Smoothie",
+      hp:34, maxHp:34,
+      atk:6
+    };
+    battleText = "A wild Evil Smoothie appears!";
+  }
+
+  resetTurn();
+  setBattleUI();
+  draw();
+}
+
+function startBossBattle(){
+  ensureAudio();
+  startBattle(true);
+}
+
+function attack(who){
+  if (mode !== "battle") return;
+  ensureAudio();
+
+  const a = party[who];
+  enemy.hp -= a.atk;
+  a.acted = true;
+  battleText = `${a.name} attacks!`;
+  sfx.attack();
+  afterAction();
+}
+
+function milkSplash(){
+  if (mode !== "battle") return;
+  ensureAudio();
+
+  const m = party.milky;
+  if (m.mp < 3){ battleText = "Not enough MP!"; draw(); return; }
+
+  enemy.hp -= 8;
+  m.hp = Math.min(m.maxHp, m.hp + 4);
+  m.mp -= 3;
+  m.acted = true;
+  battleText = "Milk Splash! (+HP)";
+  sfx.special();
+  afterAction();
+}
+
+function bananaSlam(){
+  if (mode !== "battle") return;
+  ensureAudio();
+
+  const b = party.banana;
+  if (b.mp < 4){ battleText = "Not enough MP!"; draw(); return; }
+
+  enemy.hp -= 12;
+  b.mp -= 4;
+  b.acted = true;
+  battleText = "BANANA SLAM!";
+  sfx.special();
+  afterAction();
+}
+
+function afterAction(){
+  // Boss phase logic
+  if (enemy.kind === "boss" && enemy.hp > 0){
+    if (enemy.phase === 1 && enemy.hp < enemy.maxHp * 0.65){
+      enemy.phase = 2;
+      enemy.atk += 2;
+      battleText = "Guardian powers up! (Phase 2)";
+      sfx.special();
+    } else if (enemy.phase === 2 && enemy.hp < enemy.maxHp * 0.35){
+      enemy.phase = 3;
+      enemy.atk += 3;
+      battleText = "Guardian goes berserk! (Phase 3)";
+      sfx.special();
+    }
+  }
+
+  if (enemy.hp <= 0){
+    endBattle(true);
+    return;
+  }
+
+  if (party.milky.acted && party.banana.acted){
+    enemyTurn();
+  }
+
+  draw();
+}
+
+function enemyTurn(){
+  ensureAudio();
+
+  // target
+  const t = Math.random() < 0.5 ? party.milky : party.banana;
+
+  // boss special attacks by phase
+  if (enemy.kind === "boss" && enemy.phase >= 2 && Math.random() < 0.35){
+    const dmg = enemy.atk + (enemy.phase === 3 ? 4 : 2);
+    t.hp -= dmg;
+    battleText = `Guardian uses CHILL BLAST! (-${dmg})`;
+    sfx.enemy();
+  } else {
+    t.hp -= enemy.atk;
+    battleText = `${enemy.name} strikes!`;
+    sfx.enemy();
+  }
+
+  // defeat check (demo just restores you)
+  if (party.milky.hp <= 0 && party.banana.hp <= 0){
+    party.milky.hp = Math.max(1, party.milky.hp + 10);
+    party.banana.hp = Math.max(1, party.banana.hp + 10);
+    battleText = "You got knocked down… but you bounce back!";
+  }
+
+  resetTurn();
+  draw();
+}
+
+function gainXP(c, amt){
+  c.xp += amt;
+  if (c.xp >= c.next){
+    c.xp = 0;
+    c.lvl++;
+    c.next += 10;
+    c.maxHp += 5;
+    c.maxMp += 2;
+    c.atk += 1;
+    c.hp = c.maxHp;
+    c.mp = c.maxMp;
+    battleText = `${c.name} leveled up!`;
+    sfx.level();
+  }
+}
+
+function endBattle(win){
+  if (win){
+    const xp = (enemy.kind === "boss") ? 30 : 10;
+    gainXP(party.milky, xp);
+    gainXP(party.banana, xp);
+    sfx.win();
+
+    if (enemy.kind === "boss"){
+      flags.bossDefeated = true;
+      saveGame();
+      setTimeout(()=>{
+        mode = "win";
+        setWinUI();
+        draw();
+      }, 650);
+      return;
+    }
+
+    saveGame();
+  }
+
+  setTimeout(()=>{
+    mode = "world";
+    setWorldUI();
+    startMusic();
+    draw();
+  }, 650);
+}
+
+/* ===================== DRAW ===================== */
+function draw(){
+  if (mode === "title") drawTitle();
+  else if (mode === "world") drawWorld();
+  else if (mode === "battle") drawBattle();
+  else if (mode === "win") drawWin();
+}
+
+function drawTitle(){
+  ctx.fillStyle="#000"; ctx.fillRect(0,0,256,256);
+  ctx.fillStyle="#fff";
+  ctx.fillText("MILKY & BANANA RPG", 60, 60);
+  ctx.fillStyle="#aaa";
+  ctx.fillText("Tap Start to play", 78, 80);
+
+  // little scene
+  drawMilky(64,140);
+  drawBanana(160,140);
+
+  ctx.fillStyle="#666";
+  ctx.fillRect(fridgeDoor.x*tile, fridgeDoor.y*tile, 16, 16);
+  ctx.fillStyle="#fff";
+  ctx.fillText("FRIDGE", fridgeDoor.x*tile-4, fridgeDoor.y*tile-4);
+}
+
+function drawWorld(){
+  ctx.fillStyle="#3a7d44"; ctx.fillRect(0,0,256,256);
+
+  // decorative sprites
+  drawMilky(64,64);
+  drawBanana(160,96);
+
+  // fridge door goal tile
+  ctx.fillStyle = flags.bossDefeated ? "#2ecc71" : "#666";
+  ctx.fillRect(fridgeDoor.x*tile, fridgeDoor.y*tile, 16, 16);
+  ctx.fillStyle="#fff";
+  ctx.fillText(flags.bossDefeated ? "OPEN" : "FRIDGE", fridgeDoor.x*tile-6, fridgeDoor.y*tile-4);
+
+  // player
+  ctx.fillStyle="#4da6ff";
+  ctx.fillRect(player.x*tile, player.y*tile, 16, 16);
+
+  // HUD
+  ctx.fillStyle="#fff";
+  ctx.fillText(`Milky Lv${party.milky.lvl} HP ${party.milky.hp}/${party.milky.maxHp}`, 6, 12);
+  ctx.fillText(`Banana Lv${party.banana.lvl} HP ${party.banana.hp}/${party.banana.maxHp}`, 6, 24);
+}
+
+function drawBattle(){
+  ctx.fillStyle="#000"; ctx.fillRect(0,0,256,256);
+  ctx.fillStyle="#fff";
+  ctx.fillText(`MILKY & BANANA VS ${enemy.name}`, 34, 12);
+
+  drawMilky(40,60);
+  drawBanana(80,60);
+  drawEnemySprite(170,58, enemy.kind === "boss" ? "boss" : "blob");
+
+  drawBars(10,200,party.milky);
+  drawBars(90,200,party.banana);
+  drawEnemyHP(150,50,enemy);
+
+  ctx.strokeStyle="#fff";
+  ctx.strokeRect(8,140,240,40);
+  ctx.fillText(battleText, 12, 162);
+
+  if (enemy.kind === "boss"){
+    ctx.fillStyle="#aaa";
+    ctx.fillText(`Phase ${enemy.phase}`, 190, 30);
+  }
+}
+
+function drawWin(){
+  ctx.fillStyle="#000"; ctx.fillRect(0,0,256,256);
+  ctx.fillStyle="#fff";
+  ctx.fillText("YOU WIN!", 104, 70);
+  ctx.fillStyle="#aaa";
+  ctx.fillText("Milky & Banana saved the snacks.", 30, 90);
+  drawMilky(70,140);
+  drawBanana(150,140);
+}
+
+function drawBars(x,y,c){
+  ctx.fillStyle="#fff";
+  ctx.fillText(`${c.name} Lv${c.lvl}`, x, y-6);
+
+  ctx.strokeStyle="#fff";
+  ctx.strokeRect(x,y,60,6);
+  ctx.fillStyle="lime";
+  ctx.fillRect(x,y, Math.max(0,(c.hp/c.maxHp))*60, 6);
+
+  ctx.strokeRect(x,y+8,60,4);
+  ctx.fillStyle="cyan";
+  ctx.fillRect(x,y+8, Math.max(0,(c.mp/c.maxMp))*60, 4);
+}
+
+function drawEnemyHP(x,y,e){
+  ctx.fillStyle="#fff";
+  ctx.fillText(e.name, x, y-4);
+  ctx.strokeStyle="#fff";
+  ctx.strokeRect(x,y,80,6);
+  ctx.fillStyle="red";
+  ctx.fillRect(x,y, Math.max(0,(e.hp/e.maxHp))*80, 6);
+}
+
+/* ===================== BOOT ===================== */
+(function boot(){
+  // Title always shows first; Continue lights up if save exists
+  setTitleUI();
+  draw();
+})();
+</script>
+
+</body>
+</html>
